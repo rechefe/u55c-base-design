@@ -21,6 +21,9 @@ class FakeCard(u55c.Card):
         self.words = memoryview(self.buf).cast("I")
         self.wr(u55c.REG_MAGIC, u55c.MAGIC)
 
+    def close(self):
+        self.words.release()
+
 
 def fw_log(card, text):
     """Append text to the log ring the way the firmware does."""
@@ -126,6 +129,18 @@ class MailboxTests(unittest.TestCase):
         args = u55c.argparse.Namespace(action="call", values=["1", "1"], timeout=0.05)
         with self.assertRaises(u55c.CardError):
             u55c.cmd_mbox(c, args)
+
+
+class CloseTests(unittest.TestCase):
+    def test_close_releases_mmap(self):
+        """Card.close() must release the memoryview before closing the mmap."""
+        import mmap as _mmap
+        c = FakeCard()
+        c.mm = _mmap.mmap(-1, u55c.BAR_SIZE)
+        c.words = memoryview(c.mm).cast("I")
+        c.fd = os.open(os.devnull, os.O_RDONLY)
+        u55c.Card.close(c)
+        self.assertTrue(c.mm.closed)
 
 
 class LoadTests(unittest.TestCase):

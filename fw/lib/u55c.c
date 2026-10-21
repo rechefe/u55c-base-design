@@ -10,7 +10,7 @@
 void console_init(void)
 {
     SHM_LOG_WR = 0;              // host notices the reset and resynchronizes
-    SHM_IN_RD  = SHM_IN_WR;      // drop input that arrived before we started
+    SHM_IN_RD  = shm_read(&SHM_IN_WR);   // drop input that arrived before we started
     SHM_FW_BOOTS = SHM_FW_BOOTS + 1;
     SHM_FW_MAGIC = FW_MAGIC;
 }
@@ -50,8 +50,8 @@ void console_write(const char *s, size_t n)
 int console_getc(void)
 {
     uint32_t rd = SHM_IN_RD;
-    if (rd != SHM_IN_WR) {
-        int c = SHM_IN_BUF[rd % SHM_IN_SIZE];
+    if (rd != shm_read(&SHM_IN_WR)) {
+        int c = shm_read8(&SHM_IN_BUF[rd % SHM_IN_SIZE]);
         SHM_IN_RD = rd + 1;
         return c;
     }

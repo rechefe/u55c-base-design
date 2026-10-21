@@ -45,6 +45,29 @@
 
 #define FW_MAGIC      0xC0DE0001u
 
+// Read SHM data the host may be writing at the same moment. The SHM is a
+// dual-clock block RAM: a read that collides with a write from the other port
+// returns undefined data, so read until two consecutive reads agree.
+static inline uint32_t shm_read(volatile uint32_t *p)
+{
+    uint32_t a, b;
+    do {
+        a = *p;
+        b = *p;
+    } while (a != b);
+    return a;
+}
+
+static inline uint8_t shm_read8(volatile uint8_t *p)
+{
+    uint8_t a, b;
+    do {
+        a = *p;
+        b = *p;
+    } while (a != b);
+    return a;
+}
+
 // ---------------------------------------------------------------- API
 void     console_init(void);
 void     console_putc(char c);           // log ring + UART

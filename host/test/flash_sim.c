@@ -16,7 +16,8 @@
 
 static uint8_t *mem;
 static uint8_t txf[256], rxf[1024];
-static unsigned txn, rxh, rxt;
+static unsigned txn, txh, rxh, rxt;     // TX FIFO holds txf[txh..txn)
+static int inflight = -1;               // byte in the shift register, or -1
 static uint32_t cr = 0x180, ssr = ~0u, sr_err;
 static int cs_low, first_xfer = 1;
 
@@ -96,33 +97,43 @@ static void end_transaction(void)
     trn = 0;
 }
 
-static void run(void)
+static int enabled(void) { return (cr & 0x2) && !(cr & 0x100) && ssr != ~0u; }
+
+// Like the real core, a byte leaves the TX FIFO into the shift register first
+// and reaches the RX FIFO one register access later. TX_EMPTY can therefore be
+// set while the last byte is still shifting out.
+static void step(void)
 {
-    // shift out the TX FIFO when enabled, master, not inhibited, and selected
-    if (!(cr & 0x2) || (cr & 0x100) || ssr == ~0u) return;
-    if (txn && !cs_low) { cs_low = 1; trn = 0; }
-    if (getenv("SIM_REJECT_D8") && txn && trn == 0 && txf[0] == 0xD8) {
-        sr_err = 1 << 10;
-        txn = 0;
-        return;
-    }
-    for (unsigned i = 0; i < txn; i++) {
-        if (trn < sizeof tr) tr[trn++] = txf[i];
+    if (inflight >= 0) {
+        if (trn < sizeof tr) tr[trn++] = (uint8_t)inflight;
         rxf[rxt++ % sizeof rxf] = respond();
+        inflight = -1;
     }
-    txn = 0;
+    if (enabled() && txh < txn) {
+        if (!cs_low) { cs_low = 1; trn = 0; }
+        if (getenv("SIM_REJECT_D8") && trn == 0 && txf[txh] == 0xD8) {
+            sr_err = 1 << 10;
+            txh = txn = 0;
+            return;
+        }
+        inflight = txf[txh++];
+        if (txh == txn) txh = txn = 0;
+    }
 }
+
+static void run(void) { step(); }
 
 uint32_t sim_rd(uint32_t off)
 {
     init();
+    step();
     if (off == 0) return 0x55C0F00D;
     switch (off - 0x40000) {
     case 0x60: return cr;
-    case 0x64: return (rxh == rxt ? 1 : 0) | (txn == 0 ? 4 : 0) | (txn >= 256 ? 8 : 0) | sr_err;
+    case 0x64: return (rxh == rxt ? 1 : 0) | (txn == txh ? 4 : 0) | (txn >= 256 ? 8 : 0) | sr_err;
     case 0x6C: return rxh == rxt ? 0 : rxf[rxh++ % sizeof rxf];
     case 0x70: return ssr;
-    case 0x74: return txn ? txn - 1 : 0;
+    case 0x74: return txn - txh ? txn - txh - 1 : 0;
     case 0x78: return rxt - rxh ? rxt - rxh - 1 : 0;
     default:   return 0;
     }
@@ -133,11 +144,11 @@ void sim_wr(uint32_t off, uint32_t v)
     init();
     switch (off - 0x40000) {
     case 0x40:
-        if (v == 0x0A) { cr = 0x180; ssr = ~0u; txn = 0; rxh = rxt = 0; sr_err = 0; }
+        if (v == 0x0A) { cr = 0x180; ssr = ~0u; txn = txh = 0; inflight = -1; rxh = rxt = 0; sr_err = 0; cs_low = 0; trn = 0; }
         break;
     case 0x60:
         cr = v & 0x3FF;
-        if (v & 0x20) txn = 0;
+        if (v & 0x20) txn = txh = 0;
         if (v & 0x40) rxh = rxt = 0;
         cr &= ~0x60u;
         run();
@@ -147,8 +158,16 @@ void sim_wr(uint32_t off, uint32_t v)
         run();
         break;
     case 0x70:
+        if (v == ~0u && cs_low) {
+            if (inflight >= 0 || txh < txn) {
+                fprintf(stderr, "SIM: chip select raised while a byte was still shifting\n");
+                exit(5);
+            }
+            cs_low = 0;
+            ssr = v;
+            end_transaction();
+        }
         ssr = v;
-        if (ssr == ~0u && cs_low) { cs_low = 0; end_transaction(); }
         run();
         break;
     default: break;

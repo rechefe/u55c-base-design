@@ -90,6 +90,11 @@ module host_if #(
     reg [1:0]  step  = 2'd0;
     reg [31:0] scratch = 32'd0;
     reg [31:0] uptime_hi_latch = 32'd0;
+    // Flash-controller accesses give up after ~1 ms (2^18 cycles at 250 MHz),
+    // so a stuck controller can never stall a host MMIO read into a PCIe
+    // completion timeout. A timed-out read returns 0xFFFFFFFF.
+    reg [17:0] q_tmo = 18'd0;
+    wire       q_timeout = &q_tmo;
 
     wire rg_ctrl = (addr[19:16] == 4'h0);
     wire rg_shm  = (addr[19:16] == 4'h1);
@@ -145,16 +150,20 @@ module host_if #(
                         q_awvalid <= 1'b1;
                         q_wvalid  <= 1'b1;
                         q_bready  <= 1'b1;
+                        q_tmo     <= 18'd0;
                         step      <= 2'd1;
                     end
                     default: begin
+                        q_tmo <= q_tmo + 18'd1;
                         if (q_awvalid && q_awready) q_awvalid <= 1'b0;
                         if (q_wvalid  && q_wready)  q_wvalid  <= 1'b0;
-                        if (q_bvalid) begin
-                            q_bready <= 1'b0;
-                            s_bresp  <= q_bresp;
-                            s_bvalid <= 1'b1;
-                            state    <= S_WRESP;
+                        if (q_bvalid || q_timeout) begin
+                            q_awvalid <= 1'b0;
+                            q_wvalid  <= 1'b0;
+                            q_bready  <= 1'b0;
+                            s_bresp   <= q_bvalid ? q_bresp : 2'b00;
+                            s_bvalid  <= 1'b1;
+                            state     <= S_WRESP;
                         end
                     end
                 endcase
@@ -197,16 +206,19 @@ module host_if #(
                         q_araddr  <= addr[6:0];
                         q_arvalid <= 1'b1;
                         q_rready  <= 1'b1;
+                        q_tmo     <= 18'd0;
                         step      <= 2'd1;
                     end
                     default: begin
+                        q_tmo <= q_tmo + 18'd1;
                         if (q_arvalid && q_arready) q_arvalid <= 1'b0;
-                        if (q_rvalid) begin
-                            q_rready <= 1'b0;
-                            s_rdata  <= q_rdata;
-                            s_rresp  <= q_rresp;
-                            s_rvalid <= 1'b1;
-                            state    <= S_RRESP;
+                        if (q_rvalid || q_timeout) begin
+                            q_arvalid <= 1'b0;
+                            q_rready  <= 1'b0;
+                            s_rdata   <= q_rvalid ? q_rdata : 32'hFFFF_FFFF;
+                            s_rresp   <= q_rvalid ? q_rresp : 2'b00;
+                            s_rvalid  <= 1'b1;
+                            state     <= S_RRESP;
                         end
                     end
                 endcase

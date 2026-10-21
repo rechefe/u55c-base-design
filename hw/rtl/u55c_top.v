@@ -47,6 +47,26 @@ module u55c_top #(
 
     // 161.1328125 * 64 / 11 = 937.5 MHz VCO; /9.375 = 100 MHz; /19 = 49.3 MHz
     wire mmcm_fb, mmcm_locked, clk100_mmcm, clk50_mmcm, clk100, clk50;
+
+    // MMCM reset: a pulse after configuration, and again whenever the MMCM has
+    // been unlocked for ~6.5 ms (e.g. the reference started late or glitched).
+    wire       locked161;
+    reg [19:0] lock_wd   = 20'd0;
+    reg [4:0]  mmcm_rcnt = 5'd31;
+    wire       mmcm_rst  = (mmcm_rcnt != 0);
+    sync_bits #(.W(1)) u_lock161 (.clk(clk161), .d(mmcm_locked), .q(locked161));
+    always @(posedge clk161) begin
+        if (mmcm_rst) begin
+            mmcm_rcnt <= mmcm_rcnt - 1;
+            lock_wd   <= 0;
+        end else if (locked161) begin
+            lock_wd   <= 0;
+        end else if (&lock_wd) begin
+            mmcm_rcnt <= 5'd31;
+        end else begin
+            lock_wd   <= lock_wd + 1;
+        end
+    end
     MMCME4_BASE #(
         .CLKIN1_PERIOD   (6.206),
         .DIVCLK_DIVIDE   (11),
@@ -57,7 +77,7 @@ module u55c_top #(
         .CLKIN1(clk161), .CLKFBIN(mmcm_fb), .CLKFBOUT(mmcm_fb), .CLKFBOUTB(),
         .CLKOUT0(clk100_mmcm), .CLKOUT0B(), .CLKOUT1(clk50_mmcm), .CLKOUT1B(),
         .CLKOUT2(), .CLKOUT2B(), .CLKOUT3(), .CLKOUT3B(), .CLKOUT4(), .CLKOUT5(), .CLKOUT6(),
-        .LOCKED(mmcm_locked), .PWRDWN(1'b0), .RST(1'b0));
+        .LOCKED(mmcm_locked), .PWRDWN(1'b0), .RST(mmcm_rst));
     BUFG u_clk100_bufg (.I(clk100_mmcm), .O(clk100));
     BUFG u_clk50_bufg  (.I(clk50_mmcm),  .O(clk50));
 

@@ -51,16 +51,17 @@ module tb;
         .uart_txd(uart_txd), .uart_rxd({1'b1, uart_rx0}), .led(led));
 
     // ------------------------------------------------------------ flash-controller stub
+    reg        q_dead = 0;               // 1: the stub never answers (timeout test)
     reg [6:0]  q_last_waddr = 0;
     reg [31:0] q_last_wdata = 0;
     always @(posedge aclk) begin
         q_awready <= 0; q_wready <= 0; q_arready <= 0;
-        if (q_awvalid && q_wvalid && !q_awready && !q_bvalid) begin
+        if (!q_dead && q_awvalid && q_wvalid && !q_awready && !q_bvalid) begin
             q_awready <= 1; q_wready <= 1;
             q_last_waddr <= q_awaddr; q_last_wdata <= q_wdata;
             q_bvalid <= 1;
         end else if (q_bvalid && q_bready) q_bvalid <= 0;
-        if (q_arvalid && !q_arready && !q_rvalid) begin
+        if (!q_dead && q_arvalid && !q_arready && !q_rvalid) begin
             q_arready <= 1;
             q_rdata   <= 32'hA5A5_0000 | q_araddr;
             q_rvalid  <= 1;
@@ -280,6 +281,12 @@ module tb;
         check({25'd0, q_last_waddr}, 32'h60, "QSPI write address");
         check(q_last_wdata, 32'h0000_0186, "QSPI write data");
         rd32(32'h40064, r); check(r, 32'hA5A5_0064, "QSPI read forwarded");
+        q_dead = 1;
+        rd32(32'h40064, r); check(r, 32'hFFFF_FFFF, "QSPI read timeout returns all ones");
+        wr32(32'h40060, 32'h1);                                           // must not hang
+        q_dead = 0;
+        rd32(32'h40070, r); check(r, 32'hA5A5_0070, "QSPI usable after timeout");
+        rd32(32'h000, r); check(r, 32'h55C0_F00D, "MAGIC after timeout");
 
         $display("--- FPGA reload arming");
         rd32(32'h030, r); check(r, 0, "RELOAD idle");

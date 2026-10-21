@@ -22,10 +22,10 @@ static void print_uptime(void)
 
 static void mailbox_poll(void)
 {
-    uint32_t cmd = SHM_MBOX(0);
+    uint32_t cmd = shm_read(&SHM_MBOX(0));
     if (!cmd)
         return;
-    uint32_t a = SHM_MBOX(1), b = SHM_MBOX(2), r;
+    uint32_t a = shm_read(&SHM_MBOX(1)), b = shm_read(&SHM_MBOX(2)), r;
     switch (cmd) {
     case MBOX_CMD_PING: r = a + 1; break;
     case MBOX_CMD_ADD:  r = a + b; break;
@@ -73,7 +73,7 @@ static void run_command(const char *line)
         printf("heartbeat every %u s\n", (unsigned)heartbeat_s);
     } else if (!strcmp(line, "mbox")) {
         for (int i = 0; i < 8; i++)
-            printf("MBOX%d = 0x%08x\n", i, (unsigned)SHM_MBOX(i));
+            printf("MBOX%d = 0x%08x\n", i, (unsigned)shm_read(&SHM_MBOX(i)));
     } else if (!strncmp(line, "peek", 4)) {
         uint32_t a = strtoul(arg(line), 0, 0) & ~3u;
         printf("[0x%08x] = 0x%08x\n", (unsigned)a, (unsigned)REG32(a));

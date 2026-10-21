@@ -10,6 +10,8 @@
 8. [Troubleshooting](#8-troubleshooting)
 
 > **Lab machine rule:** never run `poweroff` or `shutdown` on the lab machine. Nothing can switch it back on remotely. Every procedure here uses a warm reboot (`sudo reboot`).
+>
+> **Safety net:** run `sudo sysctl -w kernel.panic=10` once, or put `kernel.panic = 10` in `/etc/sysctl.d/99-panic.conf` to keep it across reboots. If a PCIe error ever panics the kernel, the machine reboots after 10 s instead of hanging.
 
 ---
 
@@ -78,6 +80,7 @@ Find the card with `lspci -d 10ee:903f`.
 |---|---|---|
 | PCIe reset (`axi_aresetn`) | Host reboot, link down | `host_if` registers, including `CPU_CTRL` (so a host reboot releases a held CPU) |
 | `rst100` | MMCM not locked | Whole CPU subsystem, timer |
+| MMCM reset | After configuration, and whenever the MMCM stays unlocked for ~6.5 ms | MMCM (re-lock attempt) |
 | CPU reset | `CPU_CTRL.HOLD = 1`, or `rst100` | PicoRV32 only |
 
 The CPU clock is independent of PCIe. The firmware keeps running, and its log keeps filling, through a warm reboot of the host.
@@ -140,6 +143,8 @@ All host accesses are aligned 32-bit reads and writes on BAR0. Unmapped addresse
 
 `CPU_STATUS`, `CPU_PC` and the uptime cross from the 100 MHz domain and lag by a few clock cycles. If the 100 MHz clock stops, they keep their last values and `CLK_LOCKED` reads 0.
 
+Flash-controller accesses (BAR0 + `0x40000`) time out after about 1 ms. A timed-out read returns `0xFFFFFFFF`, so the host never waits on a stuck controller.
+
 ### 2.3 Shared memory (SHM)
 
 Host: BAR0 + `0x10000` + offset. CPU: `0x1000_0000` + offset. Both sides can read and write everything; the table says who writes each field.
@@ -157,6 +162,8 @@ Host: BAR0 + `0x10000` + offset. CPU: `0x1000_0000` + offset. Both sides can rea
 | `0x2000` | `LOG_BUF` | firmware | Log ring, 8 KB |
 
 The ring counters only increase; the byte for counter value `n` is at `BUF[n % size]`.
+
+SHM is a dual-clock block RAM. When the host and the CPU access the same 32-bit word in the same instant and one of them writes, the read returns undefined data. Read any SHM word the other side may be writing until two consecutive reads agree: `shm_read()` in the firmware, `Card.rd_shm()` on the host.
 
 ### 2.4 Flash controller (BAR0 + `0x40000`)
 
@@ -244,11 +251,12 @@ The bitstream also contains the demo firmware as the RAM's initial contents, so 
 
 ### 3.5 FPGA reload from flash
 
-1. The host writes `0x52454C44` to `RELOAD`. `CPU_STATUS.RELOAD_ARMED` goes high.
-2. `u55c fpga-reload` removes the device from Linux (`/sys/bus/pci/devices/<BDF>/remove`), so the kernel does not treat the link loss as an error.
-3. After 1 s, `iprog` sends the IPROG sequence to ICAPE3 (`WBSTAR = 0`, `CMD = IPROG`).
-4. The FPGA reconfigures from flash address 0. The PCIe link drops and comes back with the new image.
-5. The host finds the new device after a warm reboot.
+1. `u55c fpga-reload` runs `u55c-flash id`, which sets the flash's extended address register to 0. The FPGA reads the flash from address 0 with 3-byte addresses, so a non-zero register would make it boot from the wrong place.
+2. The host writes `0x52454C44` to `RELOAD`. `CPU_STATUS.RELOAD_ARMED` goes high.
+3. `u55c fpga-reload` masks Surprise Down errors on the upstream PCIe port and removes the device from Linux (`/sys/bus/pci/devices/<BDF>/remove`), so the kernel does not treat the link loss as an error.
+4. After 1 s, `iprog` sends the IPROG sequence to ICAPE3 (`WBSTAR = 0`, `CMD = IPROG`).
+5. The FPGA reconfigures from flash address 0. The PCIe link drops and comes back with the new image.
+6. The host finds the new device after a warm reboot.
 
 ---
 
@@ -324,6 +332,7 @@ The first build downloads the compiler (about 200 MB) into `tools/`. On the lab 
 | `int printf(const char *fmt, ...)` | Formatted output to the log ring and both UARTs. Supports `%d %i %u %x %X %p %s %c %%`, `-`/`0` flags, width, `l`/`ll`. |
 | `int puts(const char *s)`, `int putchar(int c)` | Same destinations as `printf` |
 | `void console_write(const char *s, size_t n)` | Writes `n` bytes |
+| `uint32_t shm_read(volatile uint32_t *p)` | Collision-safe read of an SHM word the host may be writing ([2.3](#23-shared-memory-shm)) |
 | `int console_getc(void)` | Next input byte from the PCIe input ring or the UART; `-1` if none. Does not block. |
 | `int console_readline(char *buf, size_t size)` | Line editor with echo and backspace. Returns 1 when a full line is in `buf`, else 0. Does not block. |
 | `uint64_t time_ticks(void)` | 100 MHz ticks since configuration |
@@ -399,6 +408,7 @@ Global option: `--bdf 0000:XX:00.0` picks a card when several are present; by de
 | `u55c flash verify IMG.mcs` | Compare the flash with an image |
 | `u55c flash read OUT.bin ADDR LEN` | Dump flash contents |
 | `u55c fpga-reload --yes [--rescan]` | Reload the FPGA from flash ([3.5](#35-fpga-reload-from-flash)) |
+| `u55c detach` | Mask Surprise Down on the upstream port and remove the card from Linux, before a JTAG load |
 
 Example session:
 
@@ -467,6 +477,8 @@ u55c.send_input(card, b"uptime\r")
 |---|---|
 | `Card(bdf=None, check=True)` | Open a card. Raises `CardError` if it is missing, not responding (`0xFFFFFFFF`), or has the wrong `MAGIC`. |
 | `Card.rd(off)` / `Card.wr(off, val)` | 32-bit BAR0 read / write |
+| `Card.rd_shm(off)` | Read until two consecutive reads agree; use for SHM words the firmware writes |
+| `Card.close()` | Unmap BAR0 |
 | `Card.uptime_ticks()` | 64-bit uptime |
 | `LogReader(card, history=False)` | `poll()` returns new log bytes since the last call (`\r` removed) |
 | `send_input(card, data)` | Append bytes to the input ring |
@@ -498,7 +510,7 @@ The flash on the card holds a different design today. That design has no PCIe fl
    ```sh
    vivado_lab -mode batch -source bitstream/jtag_program.tcl -tclargs bitstream/u55c_riscv.bit
    ```
-   The card drops off PCIe during this step; your BIOS settings keep the host from crashing.
+   The card drops off PCIe during this step; your BIOS settings keep the host from crashing. For later JTAG loads, when this image is already running, run `sudo host/u55c detach` first.
 4. Warm-reboot the host: `sudo reboot`. The FPGA keeps the image; the BIOS enumerates the new device.
 5. Check the device: `lspci -d 10ee:903f -vv | grep -E 'LnkSta|Region 0'`. Expect `Speed 8GT/s, Width x16`.
 6. Check the image: `sudo host/u55c status`. Expect `clock locked` and `cpu running`.
@@ -515,7 +527,7 @@ The image is in the FPGA only. A power loss brings back the old design from flas
    sudo host/u55c flash program bitstream/u55c_riscv.mcs
    ```
    The tool erases 64 KB sectors over the image range, programs 128-byte chunks (skipping all-`0xFF` chunks), then reads everything back. It ends with `DONE … flash programmed and verified.` Expect several minutes.
-2. If it is interrupted, run the same command again. The running FPGA image is unaffected until a reload or power cycle.
+2. If it is interrupted, run the same command again. The running FPGA image is unaffected until a reload or power cycle. On every exit, including Ctrl-C and errors, the tool sets the flash's extended address register back to 0.
 
 Alternative: AMD's `xbflash2` (separate download from the U55C page on amd.com; no XRT needed):
 

@@ -19,17 +19,19 @@ set_property -dict [list \
     CONFIG.xdma_axi_intf_mm        {AXI_Memory_Mapped} \
     CONFIG.pf0_msix_enabled        {false} \
     CONFIG.plltype                 {QPLL1} \
+    CONFIG.pcie_blk_locn           {PCIE4C_X1Y0} \
+    CONFIG.select_quad             {GTY_Quad_227} \
 ] [get_ips xdma_0]
 
 # Flash controller: layout expected by AMD xbflash2 (quad, Micron, 256-deep FIFO,
-# AXI4-Lite, no XIP, STARTUPE3 inside the core).
+# AXI4-Lite, no XIP, STARTUPE3 inside the core). In quad mode the SCK ratio is
+# fixed at 2: SCK = ext_spi_clk / 2.
 create_ip -name axi_quad_spi -vendor xilinx.com -library ip -module_name qspi_0 -dir $ip_dir
 set_property -dict [list \
     CONFIG.C_SPI_MEMORY            {2} \
     CONFIG.C_SPI_MODE              {2} \
     CONFIG.C_FIFO_DEPTH            {256} \
     CONFIG.C_NUM_SS_BITS           {1} \
-    CONFIG.C_SCK_RATIO             {8} \
     CONFIG.C_USE_STARTUP           {1} \
     CONFIG.C_USE_STARTUP_INT       {1} \
     CONFIG.C_XIP_MODE              {0} \

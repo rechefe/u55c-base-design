@@ -12,7 +12,8 @@ tool must run as root (sudo).
     sudo ./u55c.py send "help"          # type one line into the firmware console
     sudo ./u55c.py mbox call 1 41       # mailbox request -> prints the result
     sudo ./u55c.py flash program x.mcs  # write the config flash (uses ./u55c-flash)
-    sudo ./u55c.py fpga-reload          # reload the FPGA from flash
+    sudo ./u55c.py fpga-reload --yes    # reload the FPGA from flash
+    sudo ./u55c.py detach               # before loading a new bitstream over JTAG
 
 Run `./u55c.py <command> -h` for details. The register map is documented in
 docs/GUIDE.md.
@@ -138,8 +139,26 @@ class Card:
     def rd(self, off):
         return self.words[off >> 2]
 
+    def rd_shm(self, off):
+        """Read an SHM word the firmware may be writing at the same moment.
+
+        SHM is a dual-clock block RAM; a read that collides with a write from
+        the CPU side returns undefined data. Two equal reads in a row rule
+        that out."""
+        a = self.words[off >> 2]
+        while True:
+            b = self.words[off >> 2]
+            if a == b:
+                return a
+            a = b
+
     def wr(self, off, val):
         self.words[off >> 2] = val & 0xFFFFFFFF
+
+    def close(self):
+        self.words.release()
+        self.mm.close()
+        os.close(self.fd)
 
     def uptime_ticks(self):
         lo = self.rd(REG_UPTIME_LO)   # latches the high word
@@ -152,13 +171,13 @@ class LogReader:
 
     def __init__(self, card, history=False):
         self.card = card
-        wr = card.rd(SHM_LOG_WR)
+        wr = card.rd_shm(SHM_LOG_WR)
         self.rd = max(0, wr - SHM_LOG_SIZE) if history else wr
 
     def poll(self):
         """Return new log text (bytes) since the last call."""
         c = self.card
-        wr = c.rd(SHM_LOG_WR)
+        wr = c.rd_shm(SHM_LOG_WR)
         out = bytearray()
         if wr < self.rd:
             out += b"\n[u55c: firmware restarted]\n"
@@ -172,7 +191,7 @@ class LogReader:
             pos = self.rd % SHM_LOG_SIZE
             a = SHM_LOG_BUF + (pos & ~3)
             if a != word_addr:
-                word_addr, word = a, c.rd(a)
+                word_addr, word = a, c.rd_shm(a)
             out.append((word >> (8 * (pos & 3))) & 0xFF)
             self.rd += 1
         if out:
@@ -185,7 +204,7 @@ def send_input(card, data, timeout=2.0):
     wr = card.rd(SHM_IN_WR)
     t0 = time.time()
     for b in data:
-        while wr - card.rd(SHM_IN_RD) >= SHM_IN_SIZE:
+        while wr - card.rd_shm(SHM_IN_RD) >= SHM_IN_SIZE:
             if time.time() - t0 > timeout:
                 raise CardError("input ring full: is the firmware reading its console?")
             time.sleep(0.001)
@@ -204,7 +223,7 @@ def cmd_status(card, args):
     bt = card.rd(REG_BUILD_TIME)
     hz = card.rd(REG_TICK_HZ) or 100_000_000
     up = card.uptime_ticks() / hz
-    fw_ok = card.rd(SHM_FW_MAGIC) == FW_MAGIC
+    fw_ok = card.rd_shm(SHM_FW_MAGIC) == FW_MAGIC
     if st & 0x2:
         cpu = "TRAPPED (illegal instruction or misaligned access)"
     elif st & 0x1:
@@ -218,7 +237,7 @@ def cmd_status(card, args):
     print(f"clock         {'locked' if st & 0x4 else 'NOT LOCKED (100 MHz CPU clock missing)'}")
     print(f"cpu           {cpu}, last fetch at 0x{card.rd(REG_CPU_PC):08x}")
     print(f"firmware      {'console active' if fw_ok else 'no console yet'}, "
-          f"boots {card.rd(SHM_FW_BOOTS)}, log bytes {card.rd(SHM_LOG_WR)}")
+          f"boots {card.rd_shm(SHM_FW_BOOTS)}, log bytes {card.rd_shm(SHM_LOG_WR)}")
     print(f"reload        {'ARMED' if st & 0x8 else 'idle'}")
     return 0
 
@@ -341,7 +360,7 @@ def cmd_send(card, args):
 def cmd_mbox(card, args):
     if args.action == "read":
         for i in range(8):
-            print(f"MBOX{i} = 0x{card.rd(SHM_MBOX + 4 * i):08x}")
+            print(f"MBOX{i} = 0x{card.rd_shm(SHM_MBOX + 4 * i):08x}")
     elif args.action == "write":
         if len(args.values) != 2:
             raise CardError("usage: u55c mbox write INDEX VALUE")
@@ -355,12 +374,12 @@ def cmd_mbox(card, args):
             card.wr(SHM_MBOX + 4 * i, v)
         card.wr(SHM_MBOX, vals[0])               # command last: starts the request
         t0 = time.time()
-        while card.rd(SHM_MBOX) != 0:
+        while card.rd_shm(SHM_MBOX) != 0:
             if time.time() - t0 > args.timeout:
                 raise CardError("no answer: the firmware did not clear MBOX0 "
                                 "(is it running and polling the mailbox?)")
             time.sleep(0.001)
-        r = card.rd(SHM_MBOX + 4)
+        r = card.rd_shm(SHM_MBOX + 4)
         print(f"0x{r:08x} ({r})")
     return 0
 
@@ -385,6 +404,55 @@ def cmd_flash(args):
     return subprocess.call(cmd)
 
 
+def upstream_port(bdf):
+    """PCI address of the bridge/root port above the card."""
+    parent = os.path.basename(os.path.dirname(os.path.realpath(f"/sys/bus/pci/devices/{bdf}")))
+    return parent if parent.count(":") == 2 else None
+
+
+def mask_surprise_down(bdf):
+    """Stop the upstream port from reporting the coming link-down as a fatal
+    error: set bit 5 (Surprise Down) in its AER Uncorrectable Error Mask.
+    The setting lasts until the next reboot."""
+    port = upstream_port(bdf)
+    if not port:
+        print("warning: upstream port not found; Surprise Down not masked")
+        return
+    rc = subprocess.call(["setpci", "-s", port, "ECAP_AER+0x08.L=0x00000020:0x00000020"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if rc == 0:
+        print(f"masked Surprise Down errors on upstream port {port}")
+    else:
+        print(f"note: could not mask Surprise Down on {port} (setpci missing, or the port has no AER)")
+
+
+def remove_device(bdf):
+    with open(f"/sys/bus/pci/devices/{bdf}/remove", "w") as f:
+        f.write("1")
+
+
+def reset_flash_bank(bdf):
+    """Make sure the flash extended address register is 0 before the FPGA
+    reads the flash (u55c-flash resets it on start-up and exit)."""
+    tool = os.path.join(HERE, "u55c-flash")
+    if not os.path.exists(tool):
+        print("note: u55c-flash not built; skipping the flash address-register check")
+        return True
+    rc = subprocess.call([tool, "-d", bdf, "id"], stdout=subprocess.DEVNULL)
+    if rc != 0:
+        print("error: u55c-flash id failed; not reloading")
+    return rc == 0
+
+
+def cmd_detach(card, args):
+    bdf = card.bdf
+    card.close()
+    mask_surprise_down(bdf)
+    remove_device(bdf)
+    print(f"{bdf} removed from Linux. Load the new bitstream over JTAG now, then: sudo reboot")
+    return 0
+
+
 def cmd_fpga_reload(card, args):
     if not args.yes:
         print("This reloads the FPGA from flash. The card drops off PCIe for a few\n"
@@ -392,17 +460,24 @@ def cmd_fpga_reload(card, args):
               "Make sure the flash holds a good image (u55c flash verify <image.mcs>).\n"
               "Re-run with --yes to proceed.")
         return 1
+    bdf = card.bdf
+    if not reset_flash_bank(bdf):
+        return 1
+    mask_surprise_down(bdf)
     card.wr(REG_RELOAD, RELOAD_KEY)
     time.sleep(0.05)
-    if not card.rd(REG_CPU_STATUS) & 0x8:
-        raise CardError("reload did not arm (is the 100 MHz clock locked? see u55c status)")
-    # Detach the device from Linux before the link drops, so the kernel does
-    # not treat the disappearance as an error.
-    bdf = card.bdf
-    card.mm.close()
-    os.close(card.fd)
-    with open(f"/sys/bus/pci/devices/{bdf}/remove", "w") as f:
-        f.write("1")
+    armed = card.rd(REG_CPU_STATUS) & 0x8
+    # From here the FPGA reconfigures ~1 s after arming: detach from Linux
+    # first, whatever happens, so the kernel does not see the link drop on a
+    # device it still owns.
+    try:
+        card.close()
+    finally:
+        remove_device(bdf)
+    if not armed:
+        print("warning: reload did not report ARMED (is the 100 MHz clock locked?). "
+              f"{bdf} was removed; reboot to get it back: sudo reboot")
+        return 1
     print(f"reload armed; {bdf} removed from Linux. The FPGA reconfigures in ~1 s.")
     if args.rescan:
         time.sleep(args.rescan_delay)
@@ -461,6 +536,8 @@ def main(argv=None):
 
     s = sub.add_parser("flash", help="config flash: id | program IMG | verify IMG | read OUT ADDR LEN")
     s.add_argument("flash_args", nargs=argparse.REMAINDER)
+
+    sub.add_parser("detach", help="remove the card from Linux before a JTAG load")
 
     s = sub.add_parser("fpga-reload", help="reconfigure the FPGA from flash")
     s.add_argument("--yes", action="store_true", help="really do it")

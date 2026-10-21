@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -117,28 +118,30 @@ static int spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
     qwr(Q_SSR, ~1u);                     // select flash 0
     qwr(Q_CR, base);                     // un-inhibit: transfer starts
 
-    // The transfer is complete when the TX FIFO has drained (same rule as
-    // xbflash2). Then collect what was clocked in; reads need all n bytes.
+    // The transfer is complete once all n bytes have been clocked back into
+    // the RX FIFO (TX_EMPTY alone only means the last byte left the FIFO and
+    // is still shifting out). Same rule as xbflash2's finalTransfer().
     int ok = 1;
     double t0 = now();
-    while (!(qrd(Q_SR) & SR_TX_EMPTY)) {
-        if (now() - t0 > 1.0) { ok = 0; goto out; }
-    }
-    if (rx) {
-        unsigned got = 0;
-        while (got < n) {
-            if (qrd(Q_SR) & SR_RX_EMPTY) {
-                if (now() - t0 > 1.0) { ok = 0; goto out; }
-                continue;
-            }
-            rx[got++] = (uint8_t)qrd(Q_DRR);
+    unsigned got = 0;
+    while (got < n) {
+        uint32_t sr = qrd(Q_SR);
+        if (sr & SR_CMD_ERR) break;      // command rejected: nothing will be clocked
+        if (sr & SR_RX_EMPTY) {
+            if (now() - t0 > 1.0) { ok = 0; goto out; }
+            continue;
         }
+        uint8_t b = (uint8_t)qrd(Q_DRR);
+        if (rx) rx[got] = b;
+        got++;
     }
 out:
     qwr(Q_SSR, ~0u);                     // deselect
     qwr(Q_CR, base | CR_INHIBIT);
     if (!ok) {
-        fprintf(stderr, "error: SPI transfer timeout (cmd 0x%02x, SR=0x%08x)\n", tx[0], qrd(Q_SR));
+        fprintf(stderr, "error: SPI transfer timeout (cmd 0x%02x, SR=0x%08x, %u/%u bytes)\n",
+                tx[0], qrd(Q_SR), got, n);
+        qwr(Q_SRR, 0x0A);                // clear the controller state for the next command
         return -1;
     }
     if (qrd(Q_SR) & SR_CMD_ERR) {
@@ -201,6 +204,36 @@ static int set_bank(uint32_t addr)
     return 0;
 }
 
+// The extended address register must be 0 when the FPGA next configures from
+// flash (it reads address 0 with 3-byte addressing first). Restore it on every
+// exit path, including errors and Ctrl-C.
+static volatile sig_atomic_t stop_requested;
+static int device_open;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    stop_requested = 1;
+}
+
+static void restore_bank(void)
+{
+    if (!device_open) return;
+    device_open = 0;
+    cur_bank = -1;
+    if (set_bank(0))
+        fprintf(stderr, "WARNING: could not reset the flash extended address register; "
+                        "run `u55c-flash id` before reloading the FPGA\n");
+}
+
+static void check_stop(void)
+{
+    if (stop_requested) {
+        fprintf(stderr, "\ninterrupted\n");
+        exit(130);                       // atexit -> restore_bank()
+    }
+}
+
 static int flash_init(uint8_t id[5])
 {
     qwr(Q_SRR, 0x0A);                    // reset the controller
@@ -212,7 +245,8 @@ static int flash_init(uint8_t id[5])
         if (spi_xfer(tx, rx, 5)) return -1;
     memcpy(id, rx + 1, 4);
     id[4] = 0;
-    cur_bank = -1;
+    cmd1(F_CLFSR);                       // clear stale error flags from earlier tools
+    cur_bank = -1;                       // force a write: the register may be non-zero
     if (set_bank(0)) return -1;
     return 0;
 }
@@ -379,6 +413,7 @@ static int do_erase(uint32_t addr, uint32_t len)
                 if (erase_sector(s, F_SE4K)) return -1;
         }
         progress("erase", a + SECTOR_SIZE - start, end - start, t0);
+        check_stop();
     }
     return 0;
 }
@@ -404,6 +439,7 @@ static int do_program(const struct image *img)
         }
         off += n;
         progress("program", off, img->len, t0);
+        check_stop();
     }
     return 0;
 }
@@ -414,7 +450,8 @@ static int do_verify(const struct image *img)
     double t0 = now();
     for (uint32_t off = 0; off < img->len;) {
         uint32_t a = img->base + off;
-        uint32_t n = img->len - off < CHUNK ? img->len - off : CHUNK;
+        uint32_t n = CHUNK - (a % CHUNK);    // aligned: never crosses a 16 MB bank
+        if (n > img->len - off) n = img->len - off;
         if (read_chunk(a, buf, n)) return -1;
         for (uint32_t i = 0; i < n; i++) {
             if (buf[i] != img->data[off + i]) {
@@ -425,6 +462,7 @@ static int do_verify(const struct image *img)
         }
         off += n;
         progress("verify", off, img->len, t0);
+        check_stop();
     }
     return 0;
 }
@@ -532,6 +570,11 @@ int main(int argc, char **argv)
     const char *cmd = pos[0];
 
     open_device(bdf);
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_signal);
+    device_open = 1;
+    atexit(restore_bank);
     uint8_t id[5];
     if (flash_init(id)) die("flash controller not responding");
     fprintf(stderr, "flash JEDEC ID %02x %02x %02x %02x", id[0], id[1], id[2], id[3]);
@@ -559,10 +602,12 @@ int main(int argc, char **argv)
         if ((uint64_t)a + n > FLASH_SIZE) die("range past end of flash");
         uint8_t *buf = malloc(n ? n : 1);
         double t0 = now();
-        for (uint32_t off = 0; off < n && !rc; off += CHUNK) {
-            uint32_t k = n - off < CHUNK ? n - off : CHUNK;
+        for (uint32_t off = 0, k; off < n && !rc; off += k) {
+            k = CHUNK - ((a + off) % CHUNK);     // aligned: never crosses a 16 MB bank
+            if (k > n - off) k = n - off;
             rc = read_chunk(a + off, buf + off, k);
             progress("read", off + k, n, t0);
+            check_stop();
         }
         FILE *f = fopen(pos[1], "wb");
         if (!rc && (!f || fwrite(buf, 1, n, f) != n)) die("cannot write %s", pos[1]);
@@ -572,6 +617,6 @@ int main(int argc, char **argv)
     } else {
         usage();
     }
-    set_bank(0);                         // leave the extended address register at 0
+    restore_bank();
     return rc ? 1 : 0;
 }

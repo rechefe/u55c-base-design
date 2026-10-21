@@ -46,31 +46,35 @@ module axi_null #(
         endcase
     end
 
-    // read channel: AR -> arlen+1 beats of zeros
+    // read channel: AR handshake, then arlen+1 beats of zeros
     reg [8:0] left = 9'd0;
-    reg       rs   = 1'b0;
+    reg [1:0] rs   = 2'd0;                // 0 idle, 1 accepted, 2 sending
     always @(posedge clk) begin
         arready <= 1'b0;
         if (!resetn) begin
-            rs <= 1'b0; rvalid <= 1'b0; rlast <= 1'b0;
-        end else if (!rs) begin
-            if (arvalid && !arready) begin
-                arready <= 1'b1;
-                rid     <= arid;
-                left    <= {1'b0, arlen};
-                rvalid  <= 1'b1;
-                rlast   <= (arlen == 8'd0);
-                rs      <= 1'b1;
-            end
-        end else if (rready) begin
-            if (rlast) begin
-                rvalid <= 1'b0;
-                rlast  <= 1'b0;
-                rs     <= 1'b0;
-            end else begin
-                left  <= left - 1;
-                rlast <= (left == 9'd1);
-            end
-        end
+            rs <= 2'd0; rvalid <= 1'b0; rlast <= 1'b0;
+        end else case (rs)
+            2'd0: if (arvalid && !arready) begin
+                      arready <= 1'b1;
+                      rid     <= arid;
+                      left    <= {1'b0, arlen};
+                      rs      <= 2'd1;
+                  end
+            2'd1: begin
+                      rvalid <= 1'b1;
+                      rlast  <= (left == 9'd0);
+                      rs     <= 2'd2;
+                  end
+            default: if (rready) begin
+                      if (rlast) begin
+                          rvalid <= 1'b0;
+                          rlast  <= 1'b0;
+                          rs     <= 2'd0;
+                      end else begin
+                          left  <= left - 1;
+                          rlast <= (left == 9'd1);
+                      end
+                  end
+        endcase
     end
 endmodule
