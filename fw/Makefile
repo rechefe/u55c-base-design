@@ -2,9 +2,10 @@
 #   make            -> build/<APP>.elf/.bin/.hex  (APP defaults to demo)
 #   make APP=foo    -> builds apps/foo/*.c
 #   make toolchain  -> downloads the xPack RISC-V GCC into ../tools/
-ROOT       := $(abspath ..)
+FW_DIR     := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+TOOLS      := $(abspath $(FW_DIR)/../tools)
 XPACK_VER  := 14.2.0-3
-XPACK_DIR  := $(ROOT)/tools/xpack-riscv-none-elf-gcc-$(XPACK_VER)
+XPACK_DIR  := $(TOOLS)/xpack-riscv-none-elf-gcc-$(XPACK_VER)
 XPACK_URL  := https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v$(XPACK_VER)/xpack-riscv-none-elf-gcc-$(XPACK_VER)-linux-x64.tar.gz
 CROSS      ?= $(XPACK_DIR)/bin/riscv-none-elf-
 
@@ -29,17 +30,17 @@ $(BUILD)/$(APP).bin: $(BUILD)/$(APP).elf
 
 # One 32-bit little-endian word per line, for $readmemh (bitstream RAM init).
 $(BUILD)/$(APP).hex: $(BUILD)/$(APP).bin
-	python3 -I $(ROOT)/fw/bin2hex.py $< $@
+	python3 -I $(FW_DIR)/bin2hex.py $< $@
 
 $(BUILD)/$(APP).lst: $(BUILD)/$(APP).elf
 	$(CROSS)objdump -d -S $< > $@
 
 toolchain: $(CROSS)gcc
 $(CROSS)gcc:
-	@mkdir -p $(ROOT)/tools
-	curl -fL --retry 3 -o $(ROOT)/tools/xpack.tar.gz $(XPACK_URL)
-	tar -xzf $(ROOT)/tools/xpack.tar.gz -C $(ROOT)/tools
-	rm -f $(ROOT)/tools/xpack.tar.gz
+	@mkdir -p $(TOOLS)
+	curl -fL --retry 3 -o $(TOOLS)/xpack.tar.gz $(XPACK_URL)
+	tar -xzf $(TOOLS)/xpack.tar.gz -C $(TOOLS)
+	rm -f $(TOOLS)/xpack.tar.gz
 
 clean:
 	rm -rf $(BUILD)
