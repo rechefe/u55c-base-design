@@ -1,0 +1,10 @@
+build/
+tools/
+fw/build/
+host/u55c-flash
+host/flash_test
+host/__pycache__/
+*.o
+*.jou
+*.log
+.Xil/
