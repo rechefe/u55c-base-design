@@ -50,9 +50,10 @@ release: fw
 	cp $(HW_OUT)/u55c_riscv.bit $(HW_OUT)/u55c_riscv.mcs $(HW_OUT)/build_info.txt $(REL)/bitstream/
 	cp fw/build/demo.bin fw/build/demo.elf $(REL)/fw/
 	rsync -a --exclude build fw/ $(REL)/fw/src/
-	rsync -a --exclude '*.o' --exclude u55c-flash --exclude __pycache__ host/ $(REL)/host/
+	rsync -a --exclude '*.o' --exclude u55c-flash --exclude flash_test --exclude __pycache__ host/ $(REL)/host/
 	cp -r docs README.md $(REL)/
 	cp hw/scripts/jtag_program.tcl hw/scripts/jtag_flash.tcl $(REL)/bitstream/
+	cd $(REL) && sha256sum bitstream/u55c_riscv.bit bitstream/u55c_riscv.mcs fw/demo.bin > SHA256SUMS
 	tar -C build/release -czf build/release/u55c-riscv.tar.gz u55c-riscv
 	@echo "release: build/release/u55c-riscv.tar.gz"
 

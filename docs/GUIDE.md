@@ -296,6 +296,7 @@ Run these on the build server, from the repository root.
 | `fw/src/` | Firmware sources and Makefile |
 | `host/` | `u55c`, `u55c.py`, `u55c_flash.c`, Makefile, tests |
 | `docs/`, `README.md` | Documentation |
+| `SHA256SUMS` | Checksums; check with `sha256sum -c SHA256SUMS` after copying |
 
 ---
 
